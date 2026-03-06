@@ -60,7 +60,7 @@ static void LoadRealVersion() {
         "GetFileVersionInfoSizeExW", "GetFileVersionInfoSizeW",
         "GetFileVersionInfoW",
         "VerFindFileA", "VerFindFileW", "VerInstallFileA", "VerInstallFileW",
-        "VerLanguageNameA", "VerLanguageNameW", "VerQueryValueA", "VerQueryValueW"
+        "VerLanguageNameA", "VerLanguageNameW", "VerQueryValueA", "VerQueryValueW",
     };
     for (int i = 0; i < 17; i++)
         g_OrigFuncs[i] = GetProcAddress(g_RealVersion, names[i]);
@@ -73,6 +73,89 @@ typedef int (WINAPI* fnRecv)(SOCKET, char*, int, int);
 
 static fnSend g_RealSend = nullptr;
 static fnRecv g_RealRecv = nullptr;
+
+/* --- NtQuerySystemInformation hook: process listesinden CE/dbg araclari gizle --- */
+typedef LONG NTSTATUS;
+#define NT_SUCCESS(s) (((NTSTATUS)(s)) >= 0)
+#define SystemProcessInformation 5
+typedef NTSTATUS (NTAPI *fnNtQuerySystemInformation)(ULONG, PVOID, ULONG, PULONG);
+static fnNtQuerySystemInformation g_RealNtQSI = nullptr;
+#define ProcessDebugPort 7
+typedef NTSTATUS (NTAPI *fnNtQueryInformationProcess)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+static fnNtQueryInformationProcess g_RealNtQIP = nullptr;
+static NTSTATUS NTAPI hkNtQueryInformationProcess(HANDLE h, ULONG cls, PVOID buf, ULONG len, PULONG ret) {
+    NTSTATUS st = g_RealNtQIP(h, cls, buf, len, ret);
+    if (NT_SUCCESS(st) && cls == ProcessDebugPort && buf && len >= sizeof(ULONG_PTR))
+        *(ULONG_PTR*)buf = 0;
+    return st;
+}
+
+/* IsWindowVisible: her zaman 0 don - gorunurluk kontrolunde hicbir pencere gorunur gorunmesin */
+typedef BOOL (WINAPI *fnIsWindowVisible)(HWND);
+static fnIsWindowVisible g_RealIsWindowVisible = nullptr;
+static BOOL WINAPI hkIsWindowVisible(HWND hwnd) {
+    (void)hwnd;
+    return 0;
+}
+/* x86 SYSTEM_PROCESS_INFORMATION: NextEntryOffset=0, ImageName UNICODE_STRING=+0x44 (Length,MaxLen,Buffer) */
+#define OFF_NextEntry  0
+#define OFF_ImageName  0x44
+static bool IsBlacklistedProcess(const WCHAR* buf, UINT len) {
+    if (!buf || len == 0) return false;
+    char tmp[128];
+    UINT i;
+    for (i = 0; i < len && i < 127; i++) tmp[i] = (char)(buf[i] & 0xFF);
+    tmp[i < 127 ? i : 127] = 0;
+    for (i = 0; tmp[i]; i++) if (tmp[i] >= 'A' && tmp[i] <= 'Z') tmp[i] += 32;
+    const char* list[] = { "cheat engine", "cheatengine", "x64dbg", "x32dbg", "ollydbg", "process hacker", "processhacker", "ida", "ida64", "ida32", "dnspy", "de4dot", "dotpeek", "reshade", "inject", "debugger", NULL };
+    for (int j = 0; list[j]; j++) {
+        const char* p = list[j];
+        size_t plen = strlen(p);
+        for (i = 0; tmp[i]; i++) {
+            int k = 0;
+            while (p[k] && tmp[i+k]) {
+                char c = p[k]; if (c >= 'A' && c <= 'Z') c += 32;
+                char t = tmp[i+k]; if (t >= 'A' && t <= 'Z') t += 32;
+                if (c != t) break;
+                k++;
+            }
+            if (!p[k]) return true;
+        }
+    }
+    return false;
+}
+static NTSTATUS NTAPI hkNtQuerySystemInformation(ULONG cls, PVOID buf, ULONG len, PULONG ret) {
+    NTSTATUS st = g_RealNtQSI(cls, buf, len, ret);
+    if (!NT_SUCCESS(st) || cls != SystemProcessInformation || !buf || len < 0x60) return st;
+    __try {
+        BYTE* cur = (BYTE*)buf;
+        BYTE* prev = NULL;
+        ULONG prevNext = 0;
+        while (1) {
+            ULONG nextOff = *(ULONG*)(cur + OFF_NextEntry);
+            UINT nameLen = *(USHORT*)(cur + OFF_ImageName);
+            WCHAR* nameBuf = *(WCHAR**)(cur + OFF_ImageName + 4);
+            if (nameBuf && nameLen && IsBlacklistedProcess(nameBuf, nameLen / sizeof(WCHAR))) {
+                if (prev == NULL) {
+                    if (nextOff == 0) break;
+                    memmove(buf, cur + nextOff, len - (ULONG)(cur - (BYTE*)buf) - nextOff);
+                    if (ret) *ret -= nextOff;
+                    cur = (BYTE*)buf;
+                    continue;
+                }
+                *(ULONG*)(prev + OFF_NextEntry) = (prevNext ? prevNext + nextOff : nextOff);
+                if (nextOff == 0) break;
+                cur += nextOff;
+                continue;
+            }
+            prev = cur;
+            prevNext = nextOff;
+            if (nextOff == 0) break;
+            cur += nextOff;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    return st;
+}
 
 #define DATA_XOR_KEY        0x55
 #define FAKE_PACKET_LEN     172
@@ -207,6 +290,18 @@ extern "C" void DoInitOnce() {
         void* pRecv = (void*)GetProcAddress(hWs2, "recv");
         if (pSend) InlineHook5(pSend, (void*)hkSend, (void**)&g_RealSend);
         if (pRecv) InlineHook5(pRecv, (void*)hkRecv, (void**)&g_RealRecv);
+    }
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    if (hNtdll) {
+        void* pNtQSI = (void*)GetProcAddress(hNtdll, "NtQuerySystemInformation");
+        void* pNtQIP = (void*)GetProcAddress(hNtdll, "NtQueryInformationProcess");
+        if (pNtQSI) InlineHook5(pNtQSI, (void*)hkNtQuerySystemInformation, (void**)&g_RealNtQSI);
+        if (pNtQIP) InlineHook5(pNtQIP, (void*)hkNtQueryInformationProcess, (void**)&g_RealNtQIP);
+    }
+    HMODULE hUser32 = GetModuleHandleA("user32.dll");
+    if (hUser32) {
+        void* pIsVis = (void*)GetProcAddress(hUser32, "IsWindowVisible");
+        if (pIsVis) InlineHook5(pIsVis, (void*)hkIsWindowVisible, (void**)&g_RealIsWindowVisible);
     }
 #endif
     InterlockedExchange(&g_InitDone, 2);
