@@ -1,0 +1,3 @@
+LIBRARY "8"
+EXPORTS
+    hookfonk @1

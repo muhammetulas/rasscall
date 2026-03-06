@@ -1,0 +1,439 @@
+#define _CRT_SECURE_NO_WARNINGS
+#include "pch.h"
+#include <Windows.h>
+#include <stdio.h>
+
+// 1 = temiz PC'de calistir, ban kontrolu sonrasi gelen recv paketi recv_captured.bin + recv_captured.txt olarak exe klasorune yazilir. Sonra 0 yapip derle.
+#define RECV_CAPTURE_MODE 0
+// 1 = her send paketi exe klasorune send_log.txt dosyasina yazilir (len + hex + ascii). Pattern bulmak icin ac, sonra 0 yap.
+#define SEND_DEBUG_LOG 0
+
+#ifndef _NTDEF_
+typedef long NTSTATUS;
+#endif
+
+#define STATUS_SUCCESS             ((NTSTATUS)0x00000000L)
+#define STATUS_ACCESS_DENIED       ((NTSTATUS)0xC0000022L)
+#define STATUS_OBJECT_NAME_NOT_FOUND ((NTSTATUS)0xC0000034L)
+
+// ProcessInformationClass degerleri (ntdll)
+#define ProcessDebugPort 7
+#define ProcessDebugFlags 31
+#define ProcessImageFileName 27   // process exe path (Unicode)
+
+typedef UINT_PTR SOCKET;
+
+typedef NTSTATUS(NTAPI* fnNtQueryInformationProcess)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+typedef NTSTATUS(NTAPI* fnNtQuerySystemInformation)(ULONG, PVOID, ULONG, PULONG);
+typedef int (WINAPI* fnSend)(SOCKET, const char*, int, int);
+typedef int (WINAPI* fnRecv)(SOCKET, char*, int, int);
+typedef BOOL(WINAPI* fnIsWindowVisible)(HWND);
+typedef HANDLE(WINAPI* fnCreateFileW)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+typedef LSTATUS(APIENTRY* fnRegOpenKeyExW)(HKEY, LPCWSTR, DWORD, REGSAM, PHKEY);
+typedef NTSTATUS(NTAPI* fnNtOpenKey)(PHANDLE, ACCESS_MASK, void*);
+typedef UINT(WINAPI* fnGetSystemFirmwareTable)(DWORD, DWORD, PVOID, DWORD);
+typedef UINT(WINAPI* fnEnumSystemFirmwareTables)(DWORD, PVOID, DWORD);
+
+static fnNtQueryInformationProcess g_RealNtQueryInformationProcess = nullptr;
+static fnNtQuerySystemInformation g_RealNtQuerySystemInformation = nullptr;
+static fnSend g_RealSend = nullptr;
+static fnRecv g_RealRecv = nullptr;
+static fnCreateFileW g_RealCreateFileW = nullptr;
+static fnRegOpenKeyExW g_RealRegOpenKeyExW = nullptr;
+static fnNtOpenKey g_RealNtOpenKey = nullptr;
+static fnGetSystemFirmwareTable g_RealGetSystemFirmwareTable = nullptr;
+static fnEnumSystemFirmwareTables g_RealEnumSystemFirmwareTables = nullptr;
+
+
+static const unsigned char g_FakePacketClean[172] = {
+    0x48,    0x54,    0x54,    0x50,    0x2F,    0x31,    0x2E,    0x31,    0x20,    0x32,    0x30,    0x30,    0x20,    0x4F,    0x4B,    0x0D,
+    0x0A,    0x44,    0x61,    0x74,    0x65,    0x3A,    0x20,    0x4D,    0x6F,    0x6E,    0x2C,    0x20,    0x30,    0x32,    0x20,    0x4D,
+    0x61,    0x72,    0x20,    0x32,    0x30,    0x32,    0x36,    0x20,    0x31,    0x36,    0x3A,    0x33,    0x38,    0x3A,    0x30,    0x34,
+    0x20,    0x47,    0x4D,    0x54,    0x0D,    0x0A,    0x53,    0x65,    0x72,    0x76,    0x65,    0x72,    0x3A,    0x20,    0x41,    0x70,
+    0x61,    0x63,    0x68,    0x65,    0x2F,    0x32,    0x2E,    0x34,    0x2E,    0x35,    0x32,    0x20,    0x28,    0x55,    0x62,    0x75,
+    0x6E,    0x74,    0x75,    0x29,    0x0D,    0x0A,    0x43,    0x6F,    0x6E,    0x74,    0x65,    0x6E,    0x74,    0x2D,    0x4C,    0x65,
+    0x6E,    0x67,    0x74,    0x68,    0x3A,    0x20,    0x32,    0x34,    0x0D,    0x0A,    0x43,    0x6F,    0x6E,    0x74,    0x65,    0x6E,
+    0x74,    0x2D,    0x54,    0x79,    0x70,    0x65,    0x3A,    0x20,    0x74,    0x65,    0x78,    0x74,    0x2F,    0x68,    0x74,    0x6D,
+    0x6C,    0x3B,    0x20,    0x63,    0x68,    0x61,    0x72,    0x73,    0x65,    0x74,    0x3D,    0x55,    0x54,    0x46,    0x2D,    0x38,
+    0x0D,    0x0A,    0x0D,    0x0A,    0x71,    0x46,    0x33,    0x42,    0x62,    0x67,    0x33,    0x61,    0x39,    0x30,    0x70,    0x6F,
+    0x49,    0x62,    0x41,    0x44,    0x56,    0x48,    0x6C,    0x6F,    0x30,    0x67,    0x3D,    0x3D
+};
+#define FAKE_PACKET_LEN 172
+
+
+static const unsigned char g_FakePacketYolayrimi[192] = {
+    0x48,    0x54,    0x54,    0x50,    0x2F,    0x31,    0x2E,    0x31,    0x20,    0x32,    0x30,    0x30,    0x20,    0x4F,    0x4B,    0x0D,
+    0x0A,    0x44,    0x61,    0x74,    0x65,    0x3A,    0x20,    0x54,    0x75,    0x65,    0x2C,    0x20,    0x30,    0x33,    0x20,    0x4D,
+    0x61,    0x72,    0x20,    0x32,    0x30,    0x32,    0x36,    0x20,    0x30,    0x30,    0x3A,    0x32,    0x38,    0x3A,    0x35,    0x35,
+    0x20,    0x47,    0x4D,    0x54,    0x0D,    0x0A,    0x53,    0x65,    0x72,    0x76,    0x65,    0x72,    0x3A,    0x20,    0x41,    0x70,
+    0x61,    0x63,    0x68,    0x65,    0x2F,    0x32,    0x2E,    0x34,    0x2E,    0x35,    0x32,    0x20,    0x28,    0x55,    0x62,    0x75,
+    0x6E,    0x74,    0x75,    0x29,    0x0D,    0x0A,    0x43,    0x6F,    0x6E,    0x74,    0x65,    0x6E,    0x74,    0x2D,    0x4C,    0x65,
+    0x6E,    0x67,    0x74,    0x68,    0x3A,    0x20,    0x34,    0x34,    0x0D,    0x0A,    0x43,    0x6F,    0x6E,    0x74,    0x65,    0x6E,
+    0x74,    0x2D,    0x54,    0x79,    0x70,    0x65,    0x3A,    0x20,    0x74,    0x65,    0x78,    0x74,    0x2F,    0x68,    0x74,    0x6D,
+    0x6C,    0x3B,    0x20,    0x63,    0x68,    0x61,    0x72,    0x73,    0x65,    0x74,    0x3D,    0x55,    0x54,    0x46,    0x2D,    0x38,
+    0x0D,    0x0A,    0x0D,    0x0A,    0x51,    0x4F,    0x77,    0x69,    0x35,    0x34,    0x6B,    0x2F,    0x36,    0x61,    0x51,    0x71,
+    0x2B,    0x64,    0x67,    0x34,    0x51,    0x2F,    0x66,    0x79,    0x6E,    0x4F,    0x43,    0x6E,    0x5A,    0x6E,    0x75,    0x49,
+    0x63,    0x53,    0x71,    0x48,    0x54,    0x75,    0x62,    0x57,    0x4A,    0x38,    0x6F,    0x42,    0x36,    0x2F,    0x41,    0x3D
+
+};
+#define FAKE_PACKET_YOLAYRIMI_LEN 192
+
+static unsigned char g_RecvFakeBuffer[172];
+
+static long g_RecvBypassActive = 0;
+static SOCKET g_RecvTargetSocket = (SOCKET)0;
+static SOCKET g_RecvInjectedSocket = (SOCKET)0;
+
+static int g_CaptureNextRecv = 0;
+static SOCKET g_CaptureSocket = (SOCKET)0;
+// "yolayrimi=" paketi gonderildikten sonra gelen recv bu dosyaya yazilir
+static int g_LogNextRecvAfterPattern = 0;
+static SOCKET g_LogRecvSocketAfterPattern = (SOCKET)0;
+
+static long g_YolayrimiBypassActive = 0;
+static SOCKET g_YolayrimiTargetSocket = (SOCKET)0;
+static SOCKET g_YolayrimiInjectedSocket = (SOCKET)0;
+
+static const wchar_t g_SpoofImageName[] = L"\\??\\C:\\Windows\\System32\\svchost.exe";
+
+static bool PathLooksLikeVm(const wchar_t* path) {
+    if (!path) return false;
+    wchar_t buf[520];
+    size_t i = 0;
+    for (; path[i] && i < 519; i++)
+        buf[i] = (wchar_t)(path[i] >= L'A' && path[i] <= L'Z' ? path[i] + 32 : path[i]);
+    buf[i] = 0;
+    const wchar_t* subs[] = { L"vmware", L"vbox", L"virtualbox", L"vmci", L"vmxnet", L"vmtools", L"vboxguest", L"vboxmouse", L"vboxvideo", L"vm3d", L"vmmem", L"hyper-v", L"xen", L"qemu" };
+    for (int k = 0; k < (int)(sizeof(subs) / sizeof(subs[0])); k++)
+        if (wcsstr(buf, subs[k])) return true;
+    return false;
+}
+
+static bool KeyPathLooksLikeVm(const wchar_t* path) {
+    if (!path) return false;
+    wchar_t buf[260];
+    size_t i = 0;
+    for (; path[i] && i < 259; i++)
+        buf[i] = (wchar_t)(path[i] >= L'A' && path[i] <= L'Z' ? path[i] + 32 : path[i]);
+    buf[i] = 0;
+    const wchar_t* subs[] = { L"vmware", L"vbox", L"virtualbox", L"xen", L"qemu", L"hyper-v" };
+    for (int k = 0; k < (int)(sizeof(subs) / sizeof(subs[0])); k++)
+        if (wcsstr(buf, subs[k])) return true;
+    return false;
+}
+
+HANDLE WINAPI hkCreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile) {
+    if (lpFileName && PathLooksLikeVm(lpFileName)) {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    return g_RealCreateFileW(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+}
+
+LSTATUS APIENTRY hkRegOpenKeyExW(HKEY hKey, LPCWSTR lpSubKey, DWORD ulOptions, REGSAM samDesired, PHKEY phkResult) {
+    if (lpSubKey && KeyPathLooksLikeVm(lpSubKey)) {
+        if (phkResult) *phkResult = NULL;
+        return ERROR_FILE_NOT_FOUND;
+    }
+    return g_RealRegOpenKeyExW(hKey, lpSubKey, ulOptions, samDesired, phkResult);
+}
+
+typedef struct _UNICODE_STRING_NT {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR  Buffer;
+} UNICODE_STRING_NT, * PUNICODE_STRING_NT;
+
+typedef struct _OBJECT_ATTRIBUTES_NT {
+    ULONG Length;
+    HANDLE RootDirectory;
+    PUNICODE_STRING_NT ObjectName;
+    ULONG Attributes;
+    PVOID SecurityDescriptor;
+    PVOID SecurityQualityOfService;
+} OBJECT_ATTRIBUTES_NT, * POBJECT_ATTRIBUTES_NT;
+
+NTSTATUS NTAPI hkNtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, void* ObjectAttributes) {
+    POBJECT_ATTRIBUTES_NT oa = (POBJECT_ATTRIBUTES_NT)ObjectAttributes;
+    if (oa && oa->ObjectName && oa->ObjectName->Buffer && oa->ObjectName->Length > 0) {
+        USHORT len = oa->ObjectName->Length / sizeof(wchar_t);
+        if (len > 259) len = 259;
+        wchar_t path[260];
+        for (USHORT i = 0; i < len; i++) path[i] = (wchar_t)(oa->ObjectName->Buffer[i] >= L'A' && oa->ObjectName->Buffer[i] <= L'Z' ? oa->ObjectName->Buffer[i] + 32 : oa->ObjectName->Buffer[i]);
+        path[len] = 0;
+        if (KeyPathLooksLikeVm(path)) {
+            if (KeyHandle) *KeyHandle = NULL;
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+    }
+    return g_RealNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
+}
+
+UINT WINAPI hkGetSystemFirmwareTable(DWORD ProviderSignature, DWORD FirmwareTableID, PVOID pFirmwareTableBuffer, DWORD BufferSize) {
+    if (ProviderSignature == 0x52534D42) return 0;
+    return g_RealGetSystemFirmwareTable(ProviderSignature, FirmwareTableID, pFirmwareTableBuffer, BufferSize);
+}
+
+UINT WINAPI hkEnumSystemFirmwareTables(DWORD ProviderSignature, PVOID pFirmwareTableBuffer, DWORD BufferSize) {
+    if (ProviderSignature == 0x52534D42) return 0;
+    return g_RealEnumSystemFirmwareTables(ProviderSignature, pFirmwareTableBuffer, BufferSize);
+}
+
+NTSTATUS NTAPI hkNtQueryInformationProcess(HANDLE ProcessHandle, ULONG ProcessInformationClass,
+    PVOID ProcessInformation, ULONG ProcessInformationLength, PULONG ReturnLength) {
+    NTSTATUS status = g_RealNtQueryInformationProcess(ProcessHandle, ProcessInformationClass,
+        ProcessInformation, ProcessInformationLength, ReturnLength);
+    if (status != STATUS_SUCCESS || !ProcessInformation) return status;
+
+    HANDLE cur = GetCurrentProcess();
+    if (ProcessHandle == cur || ProcessHandle == (HANDLE)-1) {
+        if (ProcessInformationClass == ProcessDebugPort && ProcessInformationLength >= sizeof(ULONG_PTR)) {
+            *(ULONG_PTR*)ProcessInformation = 0;
+            if (ReturnLength) *ReturnLength = sizeof(ULONG_PTR);
+        }
+        if (ProcessInformationClass == ProcessDebugFlags && ProcessInformationLength >= sizeof(ULONG)) {
+            *(ULONG*)ProcessInformation = 0;
+            if (ReturnLength) *ReturnLength = sizeof(ULONG);
+        }
+        if (ProcessInformationClass == ProcessImageFileName && ProcessInformationLength >= sizeof(g_SpoofImageName)) {
+            size_t len = sizeof(g_SpoofImageName);
+            if (len > ProcessInformationLength) len = ProcessInformationLength;
+            memcpy(ProcessInformation, g_SpoofImageName, len);
+            if (ReturnLength) *ReturnLength = (ULONG)len;
+        }
+    }
+    return status;
+}
+
+NTSTATUS NTAPI hkNtTerminateProcess(HANDLE ProcessHandle, NTSTATUS ExitStatus) {
+    (void)ProcessHandle;
+    (void)ExitStatus;
+    return STATUS_ACCESS_DENIED;
+}
+
+NTSTATUS NTAPI hkNtQuerySystemInformation(ULONG SystemInformationClass, PVOID SystemInformation,
+    ULONG SystemInformationLength, PULONG ReturnLength) {
+    return g_RealNtQuerySystemInformation(SystemInformationClass, SystemInformation,
+        SystemInformationLength, ReturnLength);
+}
+
+extern "C" __declspec(dllexport) DWORD __stdcall hookfonk(int a1) {
+    (void)a1;
+    return 0;
+}
+
+// Ban bypass: bu paket gonderilince send bloklanir, recv'de g_FakePacketClean doner
+static const unsigned char g_BanCheckPattern[16] = {
+    0x6E, 0x65, 0x62, 0x61, 0x6B, 0x69, 0x79, 0x6F,
+    0x6E, 0x61, 0x6E, 0x64, 0x61, 0x76, 0x61, 0x6C
+};
+static const int g_BanCheckPatternLen = 16;
+
+// bu paket gonderilince yolayrimi send bloklanir, recv'de g_FakePacketYolayrimi doner
+static const unsigned char g_YolayrimiPattern[10] = {
+    0x79, 0x6F, 0x6C, 0x61, 0x79, 0x72, 0x69, 0x6D, 0x69, 0x3D
+};
+static const int g_YolayrimiPatternLen = 10;
+
+static bool BufferContains(const char* buf, int bufLen, const char* pat, int patLen) {
+    if (!buf || !pat || patLen <= 0 || bufLen < patLen) return false;
+    for (int i = 0; i <= bufLen - patLen; i++) {
+        if (memcmp(buf + i, pat, patLen) == 0) return true;
+    }
+    return false;
+}
+
+static bool IsBanCheckRequest(const char* buf, int len) {
+    if (!buf || len <= 0 || g_BanCheckPatternLen <= 0) return false;
+    int scan = len > 2048 ? 2048 : len;
+    return BufferContains(buf, scan, (const char*)g_BanCheckPattern, g_BanCheckPatternLen);
+}
+
+static bool IsYolayrimiRequest(const char* buf, int len) {
+    if (!buf || len <= 0 || g_YolayrimiPatternLen <= 0) return false;
+    int scan = len > 2048 ? 2048 : len;
+    return BufferContains(buf, scan, (const char*)g_YolayrimiPattern, g_YolayrimiPatternLen);
+}
+
+static void LogRecvToFile(const char* buf, int n) {
+    if (!buf || n <= 0) return;
+    wchar_t exePath[MAX_PATH] = { 0 };
+    if (GetModuleFileNameW(NULL, exePath, MAX_PATH) <= 0) return;
+    wchar_t* lastSlash = wcsrchr(exePath, L'\\');
+    if (lastSlash) *(lastSlash + 1) = 0;
+    wchar_t pathBin[MAX_PATH], pathTxt[MAX_PATH];
+    wcscpy_s(pathBin, exePath); wcscat_s(pathBin, L"recv_after_yolayrimi.bin");
+    wcscpy_s(pathTxt, exePath); wcscat_s(pathTxt, L"recv_after_yolayrimi.txt");
+    FILE* fBin = _wfopen(pathBin, L"wb");
+    if (fBin) { fwrite(buf, 1, n, fBin); fclose(fBin); }
+    FILE* fTxt = _wfopen(pathTxt, L"w");
+    if (fTxt) {
+        fprintf(fTxt, "// yolayrimi= paketinden sonra gelen recv, %d byte. g_FakePacketClean gibi kullan:\n", n);
+        fprintf(fTxt, "static const unsigned char g_FakePacketClean[%d] = {\n", n);
+        for (int i = 0; i < n; i++) {
+            fprintf(fTxt, "    0x%02X%s", (unsigned char)buf[i], (i + 1 < n) ? "," : "");
+            if ((i + 1) % 16 == 0) fprintf(fTxt, "\n");
+        }
+        fprintf(fTxt, "\n};\n#define FAKE_PACKET_LEN %d\n", n);
+        fclose(fTxt);
+    }
+}
+
+static DWORD WINAPI RecvBypassThread(LPVOID) { (void)0; return 0; }
+
+int WINAPI hkSend(SOCKET s, const char* buf, int len, int flags) {
+#if SEND_DEBUG_LOG
+    {
+        wchar_t exePath[MAX_PATH] = { 0 };
+        if (GetModuleFileNameW(NULL, exePath, MAX_PATH) > 0) {
+            wchar_t* lastSlash = wcsrchr(exePath, L'\\');
+            if (lastSlash) *(lastSlash + 1) = 0;
+            wcscat_s(exePath, L"send_log.txt");
+            FILE* f = _wfopen(exePath, L"a");
+            if (f) {
+                int dump = len > 512 ? 512 : len;
+                fprintf(f, "=== send len=%d (dump %d) ===\n", len, dump);
+                for (int i = 0; i < dump; i++) fprintf(f, "%02X ", (unsigned char)buf[i]);
+                fprintf(f, "\n");
+                for (int i = 0; i < dump; i++) fputc(buf[i] >= 32 && buf[i] < 127 ? buf[i] : '.', f);
+                fprintf(f, "\n\n");
+                fclose(f);
+            }
+        }
+    }
+#endif
+#if RECV_CAPTURE_MODE
+    if (IsBanCheckRequest(buf, len)) {
+        g_CaptureSocket = s;
+        g_CaptureNextRecv = 1;
+        g_LogNextRecvAfterPattern = 1;
+        g_LogRecvSocketAfterPattern = s;
+        return g_RealSend(s, buf, len, flags);
+    }
+#endif
+    if (IsBanCheckRequest(buf, len)) {
+        g_RecvTargetSocket = s;
+        memcpy(g_RecvFakeBuffer, g_FakePacketClean, FAKE_PACKET_LEN);
+        g_RecvBypassActive = 1;
+        CreateThread(0, 0, RecvBypassThread, 0, 0, 0);
+        return len;
+    }
+    if (IsYolayrimiRequest(buf, len)) {
+        g_YolayrimiTargetSocket = s;
+        g_YolayrimiBypassActive = 1;
+        return len;
+    }
+    return g_RealSend(s, buf, len, flags);
+}
+
+int WINAPI hkRecv(SOCKET s, char* buf, int len, int flags) {
+#if RECV_CAPTURE_MODE
+    if (g_CaptureNextRecv && s == g_CaptureSocket && buf && len > 0) {
+        int n = g_RealRecv(s, buf, len, flags);
+        if (n > 0) {
+            wchar_t exePath[MAX_PATH] = { 0 };
+            if (GetModuleFileNameW(NULL, exePath, MAX_PATH) > 0) {
+                wchar_t* lastSlash = wcsrchr(exePath, L'\\');
+                if (lastSlash) *(lastSlash + 1) = 0;
+                wchar_t pathBin[MAX_PATH], pathTxt[MAX_PATH];
+                wcscpy_s(pathBin, exePath); wcscat_s(pathBin, L"recv_captured.bin");
+                wcscpy_s(pathTxt, exePath); wcscat_s(pathTxt, L"recv_captured.txt");
+                FILE* fBin = _wfopen(pathBin, L"wb");
+                if (fBin) { fwrite(buf, 1, n, fBin); fclose(fBin); }
+                FILE* fTxt = _wfopen(pathTxt, L"w");
+                if (fTxt) {
+                    fprintf(fTxt, "// Bansiz recv paketi, %d byte. g_FakePacketClean icin:\n", n);
+                    fprintf(fTxt, "static const unsigned char g_FakePacketClean[%d] = {\n", n);
+                    for (int i = 0; i < n; i++) {
+                        fprintf(fTxt, "    0x%02X%s", (unsigned char)buf[i], (i + 1 < n) ? "," : "");
+                        if ((i + 1) % 16 == 0) fprintf(fTxt, "\n");
+                    }
+                    fprintf(fTxt, "\n};\n#define FAKE_PACKET_LEN %d\n", n);
+                    fclose(fTxt);
+                }
+            }
+            if (g_LogNextRecvAfterPattern && s == g_LogRecvSocketAfterPattern) {
+                LogRecvToFile(buf, n);
+                g_LogNextRecvAfterPattern = 0;
+                g_LogRecvSocketAfterPattern = (SOCKET)0;
+            }
+            g_CaptureNextRecv = 0;
+            g_CaptureSocket = (SOCKET)0;
+        }
+        return n;
+    }
+#endif
+    if (g_YolayrimiInjectedSocket != (SOCKET)0 && s == g_YolayrimiInjectedSocket && buf && len >= FAKE_PACKET_YOLAYRIMI_LEN) {
+        memcpy(buf, g_FakePacketYolayrimi, FAKE_PACKET_YOLAYRIMI_LEN);
+        return (int)FAKE_PACKET_YOLAYRIMI_LEN;
+    }
+    if (g_YolayrimiBypassActive && s == g_YolayrimiTargetSocket && buf && len >= FAKE_PACKET_YOLAYRIMI_LEN) {
+        memcpy(buf, g_FakePacketYolayrimi, FAKE_PACKET_YOLAYRIMI_LEN);
+        g_YolayrimiBypassActive = 0;
+        g_YolayrimiTargetSocket = (SOCKET)0;
+        g_YolayrimiInjectedSocket = s;
+        return (int)FAKE_PACKET_YOLAYRIMI_LEN;
+    }
+    if (g_RecvInjectedSocket != (SOCKET)0 && s == g_RecvInjectedSocket && buf && len >= FAKE_PACKET_LEN) {
+        memcpy(buf, g_FakePacketClean, FAKE_PACKET_LEN);
+        return (int)FAKE_PACKET_LEN;
+    }
+    if (g_RecvBypassActive && s == g_RecvTargetSocket && buf && len >= FAKE_PACKET_LEN) {
+        memcpy(buf, g_RecvFakeBuffer, FAKE_PACKET_LEN);
+        g_RecvFakeBuffer[0] = 0;
+        g_RecvBypassActive = 0;
+        g_RecvTargetSocket = (SOCKET)0;
+        g_RecvInjectedSocket = s;
+        return (int)FAKE_PACKET_LEN;
+    }
+    return g_RealRecv(s, buf, len, flags);
+}
+
+static void Hook(LPCSTR module, LPCSTR name, LPVOID hookFunc) {
+    void* target = GetProcAddress(GetModuleHandleA(module), name);
+    if (!target) return;
+    DWORD old;
+    if (!VirtualProtect(target, 5, PAGE_EXECUTE_READWRITE, &old)) return;
+    BYTE patch[5] = { 0xE9 };
+    *(DWORD*)(patch + 1) = (DWORD)(UINT_PTR)hookFunc - (DWORD)(UINT_PTR)target - 5;
+    memcpy(target, patch, 5);
+    VirtualProtect(target, 5, old, &old);
+}
+
+static bool HookTrampoline(LPCSTR module, LPCSTR name, LPVOID hookFunc, void** pOriginal) {
+    void* target = GetProcAddress(GetModuleHandleA(module), name);
+    if (!target || !pOriginal) return false;
+
+    unsigned char* tramp = (unsigned char*)VirtualAlloc(nullptr, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!tramp) return false;
+
+    memcpy(tramp, target, 5);
+    tramp[5] = 0xE9;
+    *(DWORD*)(tramp + 6) = (DWORD)((UINT_PTR)target + 5) - (DWORD)(UINT_PTR)(tramp + 10);
+    *pOriginal = tramp;
+
+    DWORD old;
+    if (!VirtualProtect(target, 5, PAGE_EXECUTE_READWRITE, &old)) { VirtualFree(tramp, 0, MEM_RELEASE); return false; }
+    *(BYTE*)target = 0xE9;
+    *(DWORD*)((BYTE*)target + 1) = (DWORD)(UINT_PTR)hookFunc - (DWORD)(UINT_PTR)target - 5;
+    VirtualProtect(target, 5, old, &old);
+    return true;
+}
+
+DWORD WINAPI InitHook(LPVOID) {
+    HookTrampoline("ntdll.dll", "NtQueryInformationProcess", (LPVOID)hkNtQueryInformationProcess, (void**)&g_RealNtQueryInformationProcess);
+    HookTrampoline("ntdll.dll", "NtQuerySystemInformation", (LPVOID)hkNtQuerySystemInformation, (void**)&g_RealNtQuerySystemInformation);
+    Hook("user32.dll", "IsWindowVisible", (LPVOID)hookfonk);
+    HookTrampoline("ws2_32.dll", "send", (LPVOID)hkSend, (void**)&g_RealSend);
+    HookTrampoline("ws2_32.dll", "recv", (LPVOID)hkRecv, (void**)&g_RealRecv);
+    return 0;
+}
+
+BOOL WINAPI DllMain(HINSTANCE hModule, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(hModule);
+        CreateThread(nullptr, 0, InitHook, nullptr, 0, nullptr);
+    }
+    return TRUE;
+}
